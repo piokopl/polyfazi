@@ -21,6 +21,7 @@ import time
 import json
 import sqlite3
 import requests
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv, set_key
@@ -169,6 +170,7 @@ def init_database():
             window_end TEXT,
             slug TEXT,
             token_id TEXT,
+            condition_id TEXT,
             side TEXT,
             trigger_price REAL,
             threshold REAL,
@@ -183,11 +185,37 @@ def init_database():
             pnl_usd REAL,
             roi_pct REAL,
             settled BOOLEAN DEFAULT 0,
-            settled_at TEXT
+            settled_at TEXT,
+            claimed BOOLEAN DEFAULT 0,
+            claimed_at TEXT,
+            claim_tx TEXT
         )
     ''')
+    
+    # Add new columns if they don't exist (for existing databases)
+    # Must be done before creating indexes on those columns
+    try:
+        c.execute('ALTER TABLE trades ADD COLUMN condition_id TEXT')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE trades ADD COLUMN claimed BOOLEAN DEFAULT 0')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE trades ADD COLUMN claimed_at TEXT')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE trades ADD COLUMN claim_tx TEXT')
+    except:
+        pass
+    
+    # Now create indexes (after columns exist)
     c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON trades(symbol)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_settled ON trades(settled)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_claimed ON trades(claimed)')
+    
     conn.commit()
     conn.close()
     log("✓ Database initialized")
@@ -198,13 +226,14 @@ def save_trade(**kwargs):
     c = conn.cursor()
     c.execute('''
         INSERT INTO trades (timestamp, symbol, window_start, window_end, slug, token_id,
-        side, trigger_price, threshold, entry_price, size, bet_usd, retry_number,
+        condition_id, side, trigger_price, threshold, entry_price, size, bet_usd, retry_number,
         order_status, order_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         datetime.now(tz=ZoneInfo('UTC')).isoformat(),
         kwargs['symbol'], kwargs['window_start'], kwargs['window_end'],
-        kwargs['slug'], kwargs['token_id'], kwargs['side'], kwargs['trigger_price'],
+        kwargs['slug'], kwargs['token_id'], kwargs.get('condition_id'),
+        kwargs['side'], kwargs['trigger_price'],
         kwargs['threshold'], kwargs['entry_price'], kwargs['size'], kwargs['bet_usd'],
         kwargs['retry_number'], kwargs['order_status'], kwargs['order_id']
     ))
@@ -235,7 +264,7 @@ def get_window_times(symbol: str):
     return window_start_et, window_end_et
 
 def get_token_ids(symbol: str):
-    """Get UP and DOWN token IDs from Gamma API"""
+    """Get UP and DOWN token IDs and condition_id from Gamma API"""
     slug = get_current_slug(symbol)
     log(f"[{symbol}] Looking for market: {slug}")
     
@@ -245,6 +274,8 @@ def get_token_ids(symbol: str):
             if r.status_code == 200:
                 m = r.json()
                 clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+                condition_id = m.get("conditionId") or m.get("condition_id")
+                
                 if isinstance(clob_ids, str):
                     try:
                         clob_ids = json.loads(clob_ids)
@@ -252,12 +283,14 @@ def get_token_ids(symbol: str):
                         clob_ids = [x.strip().strip('"') for x in clob_ids.strip("[]").split(",")]
                 if isinstance(clob_ids, list) and len(clob_ids) >= 2:
                     log(f"[{symbol}] Tokens found: UP {clob_ids[0][:10]}... | DOWN {clob_ids[1][:10]}...")
-                    return clob_ids[0], clob_ids[1]
+                    if condition_id:
+                        log(f"[{symbol}] Condition ID: {condition_id[:20]}...")
+                    return clob_ids[0], clob_ids[1], condition_id
         except Exception as e:
             log(f"[{symbol}] Error fetching tokens: {e}")
         if attempt < 12:
             time.sleep(4)
-    return None, None
+    return None, None, None
 
 def get_token_prices(up_token: str, down_token: str) -> tuple:
     """
@@ -560,13 +593,220 @@ def generate_statistics():
     send_discord(f"📊 **PERFORMANCE REPORT**\n```\n{report_text}\n```")
     conn.close()
 
+# ========================== CLAIM WINNINGS ==========================
+
+# CTF Contract on Polygon
+CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+# Minimal ABI for redeemPositions
+CTF_ABI = '''[
+    {
+        "constant": false,
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"}
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "payable": false,
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "constant": true,
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "id", "type": "uint256"}
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "payable": false,
+        "stateMutability": "view",
+        "type": "function"
+    }
+]'''
+
+def claim_winnings_for_condition(condition_id: str) -> dict:
+    """
+    Claim winnings for a specific condition by calling redeemPositions on CTF contract.
+    
+    Args:
+        condition_id: The condition ID of the resolved market
+        
+    Returns:
+        dict with success status, tx_hash, and error if any
+    """
+    try:
+        # Get account from private key
+        account = Account.from_key(PROXY_PK)
+        
+        # Setup contract
+        ctf_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+            abi=json.loads(CTF_ABI)
+        )
+        
+        # Parameters for redeemPositions
+        # collateralToken: USDC on Polygon
+        collateral_token = Web3.to_checksum_address(USDC_ADDRESS)
+        # parentCollectionId: always bytes32(0) for Polymarket
+        parent_collection_id = bytes(32)
+        # conditionId: the condition we want to redeem
+        condition_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        # indexSets: [1, 2] for binary markets (YES and NO)
+        index_sets = [1, 2]
+        
+        # Build transaction
+        nonce = w3.eth.get_transaction_count(account.address)
+        
+        # Estimate gas
+        try:
+            gas_estimate = ctf_contract.functions.redeemPositions(
+                collateral_token,
+                parent_collection_id,
+                condition_id_bytes,
+                index_sets
+            ).estimate_gas({'from': account.address})
+            gas_limit = int(gas_estimate * 1.2)  # 20% buffer
+        except Exception as e:
+            log(f"  Gas estimation failed: {e}")
+            # Default gas limit if estimation fails
+            gas_limit = 200000
+        
+        # Get gas price
+        gas_price = w3.eth.gas_price
+        
+        # Build the transaction
+        tx = ctf_contract.functions.redeemPositions(
+            collateral_token,
+            parent_collection_id,
+            condition_id_bytes,
+            index_sets
+        ).build_transaction({
+            'from': account.address,
+            'nonce': nonce,
+            'gas': gas_limit,
+            'gasPrice': gas_price,
+            'chainId': CHAIN_ID
+        })
+        
+        # Sign and send
+        signed_tx = w3.eth.account.sign_transaction(tx, PROXY_PK)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        tx_hash_hex = tx_hash.hex()
+        
+        log(f"  📤 Claim TX sent: {tx_hash_hex}")
+        
+        # Wait for receipt
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        
+        if receipt['status'] == 1:
+            log(f"  ✅ Claim successful! TX: {tx_hash_hex}")
+            return {
+                'success': True,
+                'tx_hash': tx_hash_hex,
+                'error': None
+            }
+        else:
+            log(f"  ❌ Claim TX failed (reverted)")
+            return {
+                'success': False,
+                'tx_hash': tx_hash_hex,
+                'error': 'Transaction reverted'
+            }
+            
+    except Exception as e:
+        log(f"  ❌ Claim error: {e}")
+        return {
+            'success': False,
+            'tx_hash': None,
+            'error': str(e)
+        }
+
+def claim_all_unclaimed_trades():
+    """
+    Claim winnings for all unclaimed trades where window has ended.
+    Should be called ~5 minutes after window closes.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.now(tz=ZoneInfo('UTC'))
+    
+    # Find trades that:
+    # 1. Are not claimed yet
+    # 2. Window has ended (at least 5 minutes ago to ensure resolution)
+    # 3. Have a condition_id
+    five_min_ago = (now - timedelta(minutes=5)).isoformat()
+    
+    c.execute('''
+        SELECT DISTINCT condition_id, symbol 
+        FROM trades 
+        WHERE claimed = 0 
+        AND condition_id IS NOT NULL 
+        AND datetime(window_end) < datetime(?)
+    ''', (five_min_ago,))
+    
+    unclaimed = c.fetchall()
+    
+    if not unclaimed:
+        log("ℹ No unclaimed trades to process")
+        conn.close()
+        return
+    
+    log(f"💰 Claiming winnings for {len(unclaimed)} conditions...")
+    
+    claimed_count = 0
+    failed_count = 0
+    
+    for condition_id, symbol in unclaimed:
+        log(f"[{symbol}] Claiming condition: {condition_id[:20]}...")
+        
+        result = claim_winnings_for_condition(condition_id)
+        
+        if result['success']:
+            # Mark all trades with this condition_id as claimed
+            c.execute('''
+                UPDATE trades 
+                SET claimed = 1, claimed_at = ?, claim_tx = ? 
+                WHERE condition_id = ?
+            ''', (now.isoformat(), result['tx_hash'], condition_id))
+            claimed_count += 1
+        else:
+            # Check if error indicates "nothing to claim" (no balance)
+            error_str = str(result.get('error', '')).lower()
+            if 'revert' in error_str or 'execution reverted' in error_str:
+                # Likely no tokens to claim - mark as claimed anyway to avoid retrying
+                log(f"[{symbol}] No tokens to claim or already claimed")
+                c.execute('''
+                    UPDATE trades 
+                    SET claimed = 1, claimed_at = ?, claim_tx = 'NO_BALANCE' 
+                    WHERE condition_id = ?
+                ''', (now.isoformat(), condition_id))
+                claimed_count += 1
+            else:
+                failed_count += 1
+        
+        # Small delay between claims
+        time.sleep(2)
+    
+    conn.commit()
+    conn.close()
+    
+    if claimed_count > 0 or failed_count > 0:
+        msg = f"💰 Claim results: {claimed_count} claimed, {failed_count} failed"
+        log(msg)
+        send_discord(msg)
+
 # ========================== MAIN TRADING LOGIC ==========================
 
 def execute_buy(symbol: str, token_id: str, side: str, trigger_price: float, 
-                threshold: float, bet_amount: float, retry_number: int) -> bool:
+                threshold: float, bet_amount: float, retry_number: int, condition_id: str = None) -> bool:
     """
     Execute a buy order for a token.
     Returns True if order was placed successfully.
+    Retries up to 5 times if order fails.
     """
     # Get current ask price (what we would pay)
     ask_price = get_best_ask_price(token_id)
@@ -593,33 +833,50 @@ def execute_buy(symbol: str, token_id: str, side: str, trigger_price: float,
     log(f"[{symbol}] 📈 BUY {side} ${bet_amount:.2f}{retry_str} | Trigger: {trigger_price:.4f} >= {threshold:.4f} | Price: {price:.4f}")
     send_discord(f"**[{symbol}] BUY {side} ${bet_amount:.2f}**{retry_str} | Trigger: {trigger_price:.4f} | Price: {price:.4f}")
     
-    # Place order
-    result = place_order(token_id, price, size)
-    log(f"[{symbol}] Order status: {result['status']}")
+    # Place order with up to 5 retries
+    MAX_ORDER_RETRIES = 5
+    result = None
     
-    # Save to database
-    try:
-        window_start, window_end = get_window_times(symbol)
-        save_trade(
-            symbol=symbol,
-            window_start=window_start.isoformat(),
-            window_end=window_end.isoformat(),
-            slug=get_current_slug(symbol),
-            token_id=token_id,
-            side=side,
-            trigger_price=trigger_price,
-            threshold=threshold,
-            entry_price=price,
-            size=size,
-            bet_usd=bet_amount,
-            retry_number=retry_number,
-            order_status=result['status'],
-            order_id=result['order_id'],
-        )
-    except Exception as e:
-        log(f"[{symbol}] Database error: {e}")
+    for attempt in range(1, MAX_ORDER_RETRIES + 1):
+        result = place_order(token_id, price, size)
+        
+        if result['success']:
+            log(f"[{symbol}] Order status: {result['status']}")
+            break
+        else:
+            log(f"[{symbol}] ❌ Order failed (attempt {attempt}/{MAX_ORDER_RETRIES}): {result['error']}")
+            if attempt < MAX_ORDER_RETRIES:
+                log(f"[{symbol}] Retrying in 2s...")
+                time.sleep(2)
     
-    return result['success']
+    # Only save to database if order was successful
+    if result and result['success']:
+        try:
+            window_start, window_end = get_window_times(symbol)
+            save_trade(
+                symbol=symbol,
+                window_start=window_start.isoformat(),
+                window_end=window_end.isoformat(),
+                slug=get_current_slug(symbol),
+                token_id=token_id,
+                condition_id=condition_id,
+                side=side,
+                trigger_price=trigger_price,
+                threshold=threshold,
+                entry_price=price,
+                size=size,
+                bet_usd=bet_amount,
+                retry_number=retry_number,
+                order_status=result['status'],
+                order_id=result['order_id'],
+            )
+        except Exception as e:
+            log(f"[{symbol}] Database error: {e}")
+        return True
+    else:
+        log(f"[{symbol}] ❌ Order failed after {MAX_ORDER_RETRIES} attempts, not saving to database")
+        send_discord(f"**[{symbol}] ❌ ORDER FAILED** {side} ${bet_amount:.2f} after {MAX_ORDER_RETRIES} attempts")
+        return False
 
 def check_and_trade_symbol(symbol: str, retry_number: int = 0, bet_multiplier: float = 1.0):
     """
@@ -630,8 +887,8 @@ def check_and_trade_symbol(symbol: str, retry_number: int = 0, bet_multiplier: f
         retry_number: Current retry number (0 = first check)
         bet_multiplier: Multiplier for bet amount (compounds with retries)
     """
-    # Get token IDs
-    up_id, down_id = get_token_ids(symbol)
+    # Get token IDs and condition_id
+    up_id, down_id, condition_id = get_token_ids(symbol)
     if not up_id or not down_id:
         log(f"[{symbol}] Market not found, skipping")
         return
@@ -651,32 +908,45 @@ def check_and_trade_symbol(symbol: str, retry_number: int = 0, bet_multiplier: f
     # Check UP threshold
     if up_price is not None and up_price >= UP_THRESHOLD:
         log(f"[{symbol}] ✓ UP threshold met: {up_price:.4f} >= {UP_THRESHOLD:.4f}")
-        execute_buy(symbol, up_id, "UP", up_price, UP_THRESHOLD, current_bet, retry_number)
+        execute_buy(symbol, up_id, "UP", up_price, UP_THRESHOLD, current_bet, retry_number, condition_id)
     else:
         log(f"[{symbol}] ✗ UP threshold NOT met: {up_price_str} < {UP_THRESHOLD:.4f}")
     
     # Check DOWN threshold
     if down_price is not None and down_price >= DOWN_THRESHOLD:
         log(f"[{symbol}] ✓ DOWN threshold met: {down_price:.4f} >= {DOWN_THRESHOLD:.4f}")
-        execute_buy(symbol, down_id, "DOWN", down_price, DOWN_THRESHOLD, current_bet, retry_number)
+        execute_buy(symbol, down_id, "DOWN", down_price, DOWN_THRESHOLD, current_bet, retry_number, condition_id)
     else:
         log(f"[{symbol}] ✗ DOWN threshold NOT met: {down_price_str} < {DOWN_THRESHOLD:.4f}")
+
+def run_check_for_symbol(symbol: str, retry_number: int, bet_multiplier: float):
+    """Wrapper function to run check_and_trade_symbol in a thread"""
+    try:
+        check_and_trade_symbol(symbol, retry_number=retry_number, bet_multiplier=bet_multiplier)
+    except Exception as e:
+        log(f"[{symbol}] ❌ Thread error: {e}")
 
 def process_window():
     """
     Process a single 15-minute window:
     1. Wait for CHECK_DELAY_SEC after window opens
-    2. Check all markets
+    2. Check all markets IN PARALLEL
     3. If retries enabled, repeat checks every minute up to MAX_RETRIES times
     """
     log(f"\n{'='*90}")
     log(f"🔄 NEW WINDOW | {datetime.now(tz=ZoneInfo('UTC')).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     log(f"{'='*90}\n")
     
-    # Initial check (retry_number = 0)
+    # Initial check (retry_number = 0) - run all markets in parallel
+    threads = []
     for sym in MARKETS:
-        check_and_trade_symbol(sym, retry_number=0, bet_multiplier=1.0)
-        time.sleep(1)
+        t = threading.Thread(target=run_check_for_symbol, args=(sym, 0, 1.0))
+        t.start()
+        threads.append(t)
+    
+    # Wait for all threads to complete
+    for t in threads:
+        t.join()
     
     # Handle retries if enabled
     if RETRIES_ENABLED and MAX_RETRIES > 0:
@@ -695,12 +965,22 @@ def process_window():
             log(f"🔁 RETRY #{retry}/{MAX_RETRIES} | Bet multiplier: {current_multiplier:.2f}x")
             log(f"{'='*90}\n")
             
+            # Run all markets in parallel
+            threads = []
             for sym in MARKETS:
-                check_and_trade_symbol(sym, retry_number=retry, bet_multiplier=current_multiplier)
-                time.sleep(1)
+                t = threading.Thread(target=run_check_for_symbol, args=(sym, retry, current_multiplier))
+                t.start()
+                threads.append(t)
+            
+            # Wait for all threads to complete
+            for t in threads:
+                t.join()
     
     # Settle any completed trades
     check_and_settle_trades()
+    
+    # Claim winnings for trades from previous windows (5+ min after window end)
+    claim_all_unclaimed_trades()
 
 # ========================== MAIN ==========================
 
@@ -727,25 +1007,31 @@ def main():
     log("=" * 90)
 
     cycle = 0
+    
     while True:
         try:
-            # Calculate time to wait until next window + delay
             now = datetime.utcnow()
             
             # Seconds into current 15-minute window
             seconds_into_window = (now.minute % 15) * 60 + now.second
             
-            # If we haven't reached CHECK_DELAY_SEC yet in this window, wait for it
-            if seconds_into_window < CHECK_DELAY_SEC:
-                wait = CHECK_DELAY_SEC - seconds_into_window
-                log(f"⏱️ Waiting {wait}s until check time ({CHECK_DELAY_SEC}s into window)...")
-                time.sleep(wait)
+            # Always wait for NEXT window start, then add CHECK_DELAY_SEC
+            # Time until next window starts (0, 15, 30, 45 minute marks)
+            seconds_to_next_window = 900 - seconds_into_window
+            
+            # If we're very close to window start (within 2 seconds), treat as new window
+            if seconds_to_next_window > 898:
+                seconds_to_next_window = 0
+            
+            total_wait = seconds_to_next_window + CHECK_DELAY_SEC
+            
+            if seconds_to_next_window > 0:
+                next_window_min = ((now.minute // 15) + 1) * 15 % 60
+                log(f"⏱️ Waiting {seconds_to_next_window}s for next window (:{next_window_min:02d}) + {CHECK_DELAY_SEC}s delay = {total_wait}s total")
             else:
-                # We've passed the check time, wait for next window
-                wait_to_next_window = 900 - seconds_into_window  # seconds until next window
-                wait = wait_to_next_window + CHECK_DELAY_SEC
-                log(f"⏱️ Waiting {wait}s until next window + {CHECK_DELAY_SEC}s delay...")
-                time.sleep(wait)
+                log(f"⏱️ Window just started, waiting {CHECK_DELAY_SEC}s delay...")
+            
+            time.sleep(total_wait)
             
             cycle += 1
             log(f"\n{'='*90}\n🔄 CYCLE #{cycle} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n{'='*90}\n")
