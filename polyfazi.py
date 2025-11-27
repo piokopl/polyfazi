@@ -926,16 +926,46 @@ def run_check_for_symbol(symbol: str, retry_number: int, bet_multiplier: float):
     except Exception as e:
         log(f"[{symbol}] ❌ Thread error: {e}")
 
+def schedule_claim_after_window():
+    """
+    Schedule claim to run 5 minutes after current window closes.
+    Runs in a separate thread so it doesn't block main trading loop.
+    """
+    now = datetime.utcnow()
+    
+    # Calculate when current window ends
+    seconds_into_window = (now.minute % 15) * 60 + now.second
+    seconds_to_window_end = 900 - seconds_into_window
+    
+    # Wait until 5 minutes after window end
+    total_wait = seconds_to_window_end + 300  # 300s = 5 minutes
+    
+    def delayed_claim():
+        log(f"💰 Claim scheduled in {total_wait}s (5 min after window closes)")
+        time.sleep(total_wait)
+        log(f"\n{'='*90}")
+        log(f"💰 CLAIM TIME | {datetime.now(tz=ZoneInfo('UTC')).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        log(f"{'='*90}\n")
+        claim_all_unclaimed_trades()
+    
+    # Start claim in background thread
+    claim_thread = threading.Thread(target=delayed_claim, daemon=True)
+    claim_thread.start()
+
 def process_window():
     """
     Process a single 15-minute window:
     1. Wait for CHECK_DELAY_SEC after window opens
     2. Check all markets IN PARALLEL
     3. If retries enabled, repeat checks every minute up to MAX_RETRIES times
+    4. Schedule claim for 5 minutes after window closes
     """
     log(f"\n{'='*90}")
     log(f"🔄 NEW WINDOW | {datetime.now(tz=ZoneInfo('UTC')).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     log(f"{'='*90}\n")
+    
+    # Schedule claim for 5 min after this window closes (runs in background)
+    schedule_claim_after_window()
     
     # Initial check (retry_number = 0) - run all markets in parallel
     threads = []
@@ -978,9 +1008,6 @@ def process_window():
     
     # Settle any completed trades
     check_and_settle_trades()
-    
-    # Claim winnings for trades from previous windows (5+ min after window end)
-    claim_all_unclaimed_trades()
 
 # ========================== MAIN ==========================
 
