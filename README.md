@@ -1,6 +1,6 @@
 # PolyFazi Trading Bot
 
-**Fully automated trading bot for Polymarket 15-minute UP/DOWN crypto prediction markets**
+**Fully automated scalping bot for Polymarket 15-minute UP/DOWN crypto prediction markets**
 
 PolyFazi monitors brand-new 15-minute Polymarket windows (BTC, ETH, SOL, XRP, etc.) and instantly buys YES (UP) or NO (DOWN) tokens whenever their price hits your predefined threshold — taking advantage of early mispricings right after a market opens.
 
